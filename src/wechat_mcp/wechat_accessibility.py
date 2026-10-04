@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 import AppKit
+from CoreFoundation import CFEqual, CFHash
 from ApplicationServices import (
     AXUIElementCreateApplication,
     AXUIElementCopyAttributeValue,
@@ -53,22 +54,66 @@ def ax_get(element, attribute):
     return value
 
 
-def dfs(element, predicate: Callable[[Any, Any, Any, Any], bool]):
+class AXTraversalLimitError(RuntimeError):
+    """The AX search is incomplete, not evidence that a control is absent."""
+
+
+def dfs(
+    element,
+    predicate: Callable[[Any, Any, Any, Any], bool],
+    *,
+    max_nodes: int = 10000,
+    max_edges: int = 20000,
+    max_seconds: float = 10.0,
+):
+    """Cycle-safe, depth-first preorder traversal of native AX objects.
+
+    Python wrappers are not native identities: deduplicate with CFHash buckets
+    and CFEqual, including collision checks. Iterators bound memory for large
+    child collections. Limits raise rather than return a misleading no-match.
+    Elapsed-time checks cannot interrupt an in-flight native call or predicate.
+    """
     if element is None:
         return None
+    if max_nodes < 1 or max_edges < 1 or max_seconds < 0:
+        raise ValueError("AX traversal limits must be positive (time may be zero)")
+    deadline = time.monotonic() + max_seconds
+    stack = [iter((element,))]
+    seen: dict[int, list[Any]] = {}
+    node_count = edge_count = 0
 
-    role = ax_get(element, kAXRoleAttribute)
-    title = ax_get(element, kAXTitleAttribute)
-    identifier = ax_get(element, kAXIdentifierAttribute)
+    def check_time():
+        if time.monotonic() >= deadline:
+            raise AXTraversalLimitError("AX traversal time limit exceeded")
 
-    if predicate(element, role, title, identifier):
-        return element
-
-    children = ax_get(element, kAXChildrenAttribute) or []
-    for child in children:
-        found = dfs(child, predicate)
-        if found is not None:
-            return found
+    while stack:
+        check_time()
+        try:
+            node = next(stack[-1])
+        except StopIteration:
+            stack.pop()
+            continue
+        edge_count += 1  # Includes the root; repeated references consume budget.
+        if edge_count > max_edges:
+            raise AXTraversalLimitError("AX traversal edge limit exceeded")
+        if node is None:
+            continue
+        bucket = seen.setdefault(int(CFHash(node)), [])
+        if any(CFEqual(node, previous) for previous in bucket):
+            continue
+        node_count += 1
+        if node_count > max_nodes:
+            raise AXTraversalLimitError("AX traversal node limit exceeded")
+        bucket.append(node)
+        role = ax_get(node, kAXRoleAttribute)
+        title = ax_get(node, kAXTitleAttribute)
+        identifier = ax_get(node, kAXIdentifierAttribute)
+        check_time()
+        if predicate(node, role, title, identifier):
+            return node
+        children = ax_get(node, kAXChildrenAttribute)
+        if children is not None:
+            stack.append(iter(children))
     return None
 
 
@@ -168,20 +213,16 @@ def collect_chat_elements(ax_app) -> dict[str, Any]:
     """
     results: dict[str, Any] = {}
 
-    def walk(element):
-        role = ax_get(element, kAXRoleAttribute)
-        identifier = ax_get(element, kAXIdentifierAttribute)
+    def collect(element, role, title, identifier):
         if isinstance(role, str) and role == kAXStaticTextRole:
             if isinstance(identifier, str) and identifier.startswith("session_item_"):
                 chat_name = identifier[len("session_item_") :]
                 if chat_name:
                     results[chat_name] = element
 
-        children = ax_get(element, kAXChildrenAttribute) or []
-        for child in children:
-            walk(child)
+        return False
 
-    walk(ax_app)
+    dfs(ax_app, collect)
     logger.info("Collected %d chat elements from session list", len(results))
     return results
 
@@ -415,10 +456,8 @@ def _collect_search_entries(search_list) -> list[SearchEntry]:
     """
     entries: list[SearchEntry] = []
 
-    def walk(el):
-        role = ax_get(el, kAXRoleAttribute)
+    def collect(el, role, title, identifier):
         if role == kAXStaticTextRole:
-            title = ax_get(el, kAXTitleAttribute)
             value = ax_get(el, kAXValueAttribute)
             text_obj = title if isinstance(title, str) and title else value
             if isinstance(text_obj, str):
@@ -433,11 +472,9 @@ def _collect_search_entries(search_list) -> list[SearchEntry]:
                     )
                 )
 
-        children = ax_get(el, kAXChildrenAttribute) or []
-        for child in children:
-            walk(child)
+        return False
 
-    walk(search_list)
+    dfs(search_list, collect)
     entries.sort(key=lambda e: e.y)
     return entries
 

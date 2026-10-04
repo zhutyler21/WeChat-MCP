@@ -151,6 +151,7 @@ uv run wechat-mcp --transport stdio
 ## Documentation
 
 - 📘 [Detailed Guide](docs/detailed-guide.md) - Complete API documentation and architecture
+- 🔎 [Accessibility traversal troubleshooting](docs/accessibility-traversal.md) - Cycle-safe traversal, offline tests, and verification boundaries
 - 🤖 [Sub-Agents Guide](.claude/agents/README.md) - How to use Claude Code sub-agents
 
 ## Requirements
